@@ -1,4 +1,4 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python
 from __future__ import print_function
 
 import glob
@@ -53,7 +53,6 @@ install_requires     = ['paramiko>=1.15.2',
                         'pyserial>=2.7',
                         'requests>=2.0',
                         'pip>=6.0.8',
-                        'tox>=1.8.1',
                         'pygments>=2.0',
                         'pysocks',
                         'python-dateutil',
@@ -61,7 +60,10 @@ install_requires     = ['paramiko>=1.15.2',
                         'psutil>=3.3.0',
                         'intervaltree>=3.0',
                         'sortedcontainers',
-                        'unicorn']
+                        'unicorn>=1.0.2rc1,<1.0.2rc4', # see unicorn-engine/unicorn#1100, unicorn-engine/unicorn#1170, Gallopsled/pwntools#1538
+                        'six>=1.12.0',
+                        'rpyc',
+]
 
 # Check that the user has installed the Python development headers
 PythonH = os.path.join(get_python_inc(), 'Python.h')
@@ -82,8 +84,8 @@ setup(
     name                 = 'pwntools',
     python_requires      = '>=2.7',
     packages             = find_packages(),
-    version              = '4.1.0dev',
-    data_files           = [('',
+    version              = '4.5.0dev',
+    data_files           = [('pwntools-doc',
                              glob.glob('*.md') + glob.glob('*.txt')),
                             ],
     package_data         = {
@@ -117,6 +119,7 @@ setup(
         'Natural Language :: English',
         'Operating System :: POSIX :: Linux',
         'Programming Language :: Python :: 2.7',
+        'Programming Language :: Python :: 3',
         'Topic :: Security',
         'Topic :: Software Development :: Assemblers',
         'Topic :: Software Development :: Debuggers',

@@ -4,19 +4,22 @@ from __future__ import division
 
 import ctypes
 import errno
-import fcntl
 import logging
 import os
 import platform
-import pty
-import resource
 import select
 import signal
 import six
 import stat
 import subprocess
+import sys
 import time
-import tty
+
+if sys.platform != 'win32':
+    import fcntl
+    import pty
+    import resource
+    import tty
 
 from pwnlib import qemu
 from pwnlib.context import context
@@ -239,12 +242,13 @@ class process(tube):
         #: :class:`subprocess.Popen` object that backs this process
         self.proc = None
 
-        if not shell:
-            executable, argv, env = self._validate(cwd, executable, argv, env)
+        # We need to keep a copy of the un-_validated environment for printing
+        original_env = env
 
-        # Permit invocation as process('sh') and process(['sh'])
-        if isinstance(argv, (bytes, six.text_type)):
-            argv = [argv]
+        if shell:
+            executable_val, argv_val, env_val = executable, argv, env
+        else:
+            executable_val, argv_val, env_val = self._validate(cwd, executable, argv, env)
 
         # Avoid the need to have to deal with the STDOUT magic value.
         if stderr is STDOUT:
@@ -269,10 +273,10 @@ class process(tube):
         stdin, stdout, stderr, master, slave = self._handles(*handles)
 
         #: Arguments passed on argv
-        self.argv = argv
+        self.argv = argv_val
 
         #: Full path to the executable
-        self.executable = executable
+        self.executable = executable_val
 
         if self.executable is None:
             if shell:
@@ -281,7 +285,7 @@ class process(tube):
                 self.executable = which(self.argv[0])
 
         #: Environment passed on envp
-        self.env = os.environ if env is None else env
+        self.env = os.environ if env is None else env_val
 
         self._cwd = os.path.realpath(cwd or os.path.curdir)
 
@@ -296,8 +300,8 @@ class process(tube):
         message = "Starting %s process %r" % (where, self.display)
 
         if self.isEnabledFor(logging.DEBUG):
-            if self.argv != [self.executable]: message += ' argv=%r ' % self.argv
-            if self.env  != os.environ:        message += ' env=%r ' % self.env
+            if argv != [self.executable]: message += ' argv=%r ' % self.argv
+            if original_env not in (os.environ, None):  message += ' env=%r ' % self.env
 
         with self.progress(message) as p:
 
@@ -308,17 +312,19 @@ class process(tube):
             # and binfmt is not installed (e.g. when running on
             # Travis CI), re-try with qemu-XXX if we get an
             # 'Exec format error'.
-            prefixes = [([], executable)]
-            executables = [executable]
+            prefixes = [([], self.executable)]
             exception = None
 
             for prefix, executable in prefixes:
                 try:
-                    self.proc = subprocess.Popen(args = prefix + argv,
+                    args = self.argv
+                    if prefix:
+                        args = prefix + args
+                    self.proc = subprocess.Popen(args = args,
                                                  shell = shell,
                                                  executable = executable,
                                                  cwd = cwd,
-                                                 env = env,
+                                                 env = self.env,
                                                  stdin = stdin,
                                                  stdout = stdout,
                                                  stderr = stderr,
@@ -509,11 +515,14 @@ class process(tube):
         # - Must be a list/tuple of strings
         # - Each string must not contain '\x00'
         #
-        if isinstance(argv, (bytes, six.text_type)):
+        if isinstance(argv, (six.text_type, six.binary_type)):
             argv = [argv]
 
-        if not all(isinstance(arg, (bytes, six.text_type)) for arg in argv):
-            self.error("argv must be strings: %r" % argv)
+        if not isinstance(argv, (list, tuple)):
+            self.error('argv must be a list or tuple: %r' % argv)
+
+        if not all(isinstance(arg, (six.text_type, six.binary_type)) for arg in argv):
+            self.error("argv must be strings or bytes: %r" % argv)
 
         # Create a duplicate so we can modify it
         argv = list(argv or [])
@@ -660,7 +669,7 @@ class process(tube):
         self.proc.poll()
         returncode = self.proc.returncode
 
-        if returncode != None and not self._stop_noticed:
+        if returncode is not None and not self._stop_noticed:
             self._stop_noticed = time.time()
             signame = ''
             if returncode < 0:
@@ -730,7 +739,7 @@ class process(tube):
             return False
 
         try:
-            if timeout == None:
+            if timeout is None:
                 return select.select([self.proc.stdout], [], []) == ([self.proc.stdout], [], [])
 
             return select.select([self.proc.stdout], [], [], timeout) == ([self.proc.stdout], [], [])
@@ -743,12 +752,12 @@ class process(tube):
             # ValueError: I/O operation on closed file
             raise EOFError
         except select.error as v:
-            if v[0] == errno.EINTR:
+            if v.args[0] == errno.EINTR:
                 return False
 
     def connected_raw(self, direction):
         if direction == 'any':
-            return self.poll() == None
+            return self.poll() is None
         elif direction == 'send':
             return not self.proc.stdin.closed
         elif direction == 'recv':
@@ -817,7 +826,7 @@ class process(tube):
             fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
             if fd >= 0:
                 os.close(fd)
-                raise Exception('Failed to disconnect from ' +
+                raise Exception('Failed to disconnect from '
                     'controlling tty. It is still possible to open /dev/tty.')
         # which exception, shouldnt' we catch explicitly .. ?
         except OSError:
@@ -857,6 +866,7 @@ class process(tube):
                 return pwnlib.elf.elf.ELF(self.executable).maps
 
         # Enumerate all of the libraries actually loaded right now.
+        maps = {}
         for line in maps_raw.splitlines():
             if '/' not in line: continue
             path = line[line.index('/'):]
@@ -881,6 +891,14 @@ class process(tube):
         Returns an ELF for the libc for the current process.
         If possible, it is adjusted to the correct address
         automatically.
+
+        Example:
+
+        >>> p = process("/bin/cat")
+        >>> libc = p.libc
+        >>> libc # doctest: +SKIP
+        ELF('/lib64/libc-...so')
+        >>> p.close()
         """
         from pwnlib.elf import ELF
 
@@ -914,20 +932,23 @@ class process(tube):
         import pwnlib.elf.corefile
         import pwnlib.gdb
 
-        if self.poll() is None:
-            return pwnlib.gdb.corefile(self)
+        try:
+            if self.poll() is None:
+                return pwnlib.gdb.corefile(self)
 
-        finder = pwnlib.elf.corefile.CorefileFinder(self)
-        if not finder.core_path:
-            self.warn("Could not find core file for pid %i" % self.pid)
-            return Ellipsis ##
+            finder = pwnlib.elf.corefile.CorefileFinder(self)
+            if not finder.core_path:
+                self.warn("Could not find core file for pid %i" % self.pid)
+                return None
 
-        core_hash = sha256file(finder.core_path)
+            core_hash = sha256file(finder.core_path)
 
-        if self._corefile and self._corefile._hash == core_hash:
-            return self._corefile
+            if self._corefile and self._corefile._hash == core_hash:
+                return self._corefile
 
-        self._corefile = pwnlib.elf.corefile.Corefile(finder.core_path)
+            self._corefile = pwnlib.elf.corefile.Corefile(finder.core_path)
+        except AttributeError as e:
+            raise RuntimeError(e) # AttributeError would route through __getattr__, losing original message
         self._corefile._hash = core_hash
 
         return self._corefile
@@ -941,7 +962,7 @@ class process(tube):
 
         Example:
 
-            >>> e = ELF('/bin/bash')
+            >>> e = ELF('/bin/bash-static')
             >>> p = process(e.path)
 
             In order to make sure there's not a race condition against

@@ -5,6 +5,9 @@ from __future__ import division
 import argparse
 import sys
 
+import pwnlib
+pwnlib.args.free_form = False
+
 from pwn import *
 from pwnlib.commandline import common
 
@@ -130,7 +133,7 @@ def main(args):
             output = output.encode('ascii')
         args.output.write(output)
 
-    if tty and fmt is not 'raw':
+    if tty and fmt != 'raw':
         args.output.write(b'\n')
 
 if __name__ == '__main__':

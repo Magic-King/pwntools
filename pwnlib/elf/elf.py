@@ -83,11 +83,18 @@ from pwnlib.tubes.process import process
 from pwnlib.util import misc
 from pwnlib.util import packing
 from pwnlib.util.fiddling import unhex
+from pwnlib.util.misc import align, align_down
 from pwnlib.util.sh_string import sh_string
 
 log = getLogger(__name__)
 
 __all__ = ['load', 'ELF']
+
+def _iter_symbols(sec):
+    # Cache result of iter_symbols.
+    if not hasattr(sec, '_symbols'):
+        sec._symbols = list(sec.iter_symbols())
+    return iter(sec._symbols)
 
 class Function(object):
     """Encapsulates information about a function in an :class:`.ELF` binary.
@@ -268,6 +275,9 @@ class ELF(ELFFile):
                 self.arch = 'mips64'
                 self.bits = 64
 
+        self._sections = None
+        self._segments = None
+
         #: IntervalTree which maps all of the loaded memory segments
         self.memory = intervaltree.IntervalTree()
         self._populate_memory()
@@ -309,7 +319,7 @@ class ELF(ELFFile):
                 config = gz.read()
 
             if config:
-                self.config = parse_kconfig(config)
+                self.config = parse_kconfig(config.decode())
 
         #: ``True`` if the ELF is a statically linked executable
         self.statically_linked = bool(self.elftype == 'EXEC' and self.load_addr)
@@ -454,9 +464,6 @@ class ELF(ELFFile):
             self.checksec(*a, **kw)
         )
 
-    def __repr__(self):
-        return "ELF(%r)" % self.path
-
     def get_machine_arch(self):
         return {
             'EM_X86_64': 'amd64',
@@ -483,6 +490,13 @@ class ELF(ELFFile):
     def elftype(self):
         """:class:`str`: ELF type (``EXEC``, ``DYN``, etc)"""
         return describe_e_type(self.header.e_type).split()[0]
+
+    def iter_segments(self):
+        # Yield and cache all the segments in the file
+        if self._segments is None:
+            self._segments = [self.get_segment(i) for i in range(self.num_segments())]
+
+        return iter(self._segments)
 
     @property
     def segments(self):
@@ -535,6 +549,13 @@ class ELF(ELFFile):
             return seg
 
         return None
+
+    def iter_sections(self):
+        # Yield and cache all the sections in the file
+        if self._sections is None:
+            self._sections = [self.get_section(i) for i in range(self.num_sections())]
+
+        return iter(self._sections)
 
     @property
     def sections(self):
@@ -591,6 +612,8 @@ class ELF(ELFFile):
         self.symbols = dotdict({k:update(v) for k,v in self.symbols.items()})
         self.plt     = dotdict({k:update(v) for k,v in self.plt.items()})
         self.got     = dotdict({k:update(v) for k,v in self.got.items()})
+        for f in self.functions.values():
+            f.address += delta
 
         # Update our view of memory
         memory = intervaltree.IntervalTree()
@@ -839,7 +862,7 @@ class ELF(ELFFile):
             if not isinstance(sec, SymbolTableSection):
                 continue
 
-            for sym in sec.iter_symbols():
+            for sym in _iter_symbols(sec):
                 # Avoid duplicates
                 if sym.name in self.functions:
                     continue
@@ -863,7 +886,7 @@ class ELF(ELFFile):
             if not isinstance(section, SymbolTableSection):
                 continue
 
-            for symbol in section.iter_symbols():
+            for symbol in _iter_symbols(section):
                 value = symbol.entry.st_value
                 if not value:
                     continue
@@ -904,7 +927,7 @@ class ELF(ELFFile):
         if self.statically_linked:
             return
 
-        for section in self.iter_sections():
+        for section in self.sections:
             # We are only interested in relocations
             if not isinstance(section, RelocationSection):
                 continue
@@ -958,7 +981,7 @@ class ELF(ELFFile):
 
         # Iterate over the dynamic symbol table
         dynsym = self.get_section_by_name('.dynsym')
-        symbol_iter = dynsym.iter_symbols()
+        symbol_iter = _iter_symbols(dynsym)
 
         # 'gotsym' is the index of the first GOT symbol
         gotsym = self.dynamic_value_by_tag('DT_MIPS_GOTSYM')
@@ -1000,9 +1023,10 @@ class ELF(ELFFile):
         #              In particular, this is where EBX points when it points into the GOT.
         dt_pltgot = self.dynamic_value_by_tag('DT_PLTGOT') or 0
 
-        # There are two PLTs we may need to search
+        # There are three PLTs we may need to search
         plt = self.get_section_by_name('.plt')          # <-- Functions only
         plt_got = self.get_section_by_name('.plt.got')  # <-- Functions used as data
+        plt_sec = self.get_section_by_name('.plt.sec')
         plt_mips = self.get_section_by_name('.MIPS.stubs')
 
         # Invert the GOT symbols we already have, so we can look up by address
@@ -1010,7 +1034,7 @@ class ELF(ELFFile):
         inv_symbols.update({v:k for k,v in self.symbols.items()})
 
         with context.local(arch=self.arch, bits=self.bits, endian=self.endian):
-            for section in (plt, plt_got, plt_mips):
+            for section in (plt, plt_got, plt_sec, plt_mips):
                 if not section:
                     continue
 
@@ -1020,7 +1044,7 @@ class ELF(ELFFile):
                                                 section.data(),
                                                 inv_symbols)
 
-                for address, target in reversed(sorted(res.items())):
+                for address, target in sorted(res.items()):
                     self.plt[inv_symbols[target]] = address
 
         for a,n in sorted({v:k for k,v in self.plt.items()}.items()):
@@ -1031,7 +1055,10 @@ class ELF(ELFFile):
             return
 
         banner = self.string(self.symbols.linux_banner)
-
+        
+        # convert banner into a utf-8 string since re.search does not accept bytes anymore
+        banner = banner.decode('utf-8')
+        
         # 'Linux version 3.18.31-gd0846ecc
         regex = r'Linux version (\S+)'
         match = re.search(regex, banner)
@@ -1046,8 +1073,51 @@ class ELF(ELFFile):
 
         self.config['version'] = self.version
 
-    def search(self, needle, writable = False):
-        """search(needle, writable = False) -> generator
+    @property
+    def libc_start_main_return(self):
+        """
+            Try to find the return address from main into __libc_start_main.
+            The heuristic to find the call to the function pointer of main is
+            to list all calls inside __libc_start_main, find the call to exit
+            after the call to main and select the previous call.
+        """
+        if '__libc_start_main' not in self.functions:
+            return 0
+
+        if 'exit' not in self.symbols:
+            return 0
+
+        # If there's no delay slot, execution continues on the next instruction after a call.
+        call_return_offset = 1
+        if self.arch in ['arm', 'thumb']:
+            call_instructions = set(['blx', 'bl'])
+        elif self.arch == 'aarch64':
+            call_instructions = set(['blr', 'bl'])
+        elif self.arch in ['mips', 'mips64']:
+            call_instructions = set(['bal', 'jalr'])
+            # Account for the delay slot.
+            call_return_offset = 2
+        elif self.arch in ['i386', 'amd64', 'ia64']:
+            call_instructions = set(['call'])
+        else:
+            log.error('Unsupported architecture %s in ELF.libc_start_main_return', self.arch)
+            return 0
+        
+        code = self.disasm(self.symbols['__libc_start_main'], self.functions['__libc_start_main'].size)
+        exit_addr = hex(self.symbols['exit'])
+        lines = code.split('\n')
+        calls = [(index, line) for index, line in enumerate(lines) if set(line.split()) & call_instructions]
+        exit_calls = [index for index, line in enumerate(calls) if exit_addr in line[1]]
+        if len(exit_calls) != 1:
+            return 0
+
+        call_to_main = calls[exit_calls[0] - 1]
+        return_from_main = lines[call_to_main[0] + call_return_offset].lstrip()
+        return_from_main = int(return_from_main[ : return_from_main.index(':') ], 16)
+        return return_from_main
+
+    def search(self, needle, writable = False, executable = False):
+        """search(needle, writable = False, executable = False) -> generator
 
         Search the ELF's virtual address space for the specified string.
 
@@ -1060,6 +1130,7 @@ class ELF(ELFFile):
         Arguments:
             needle(str): String to search for.
             writable(bool): Search only writable sections.
+            executable(bool): Search only executable sections.
 
         Yields:
             An iterator for each virtual address that matches.
@@ -1077,11 +1148,20 @@ class ELF(ELFFile):
 
             >>> len(list(bash.search(b'GNU bash'))) > 0
             True
+
+            It is also possible to search for instructions in executable sections.
+
+            >>> binary = ELF.from_assembly('nop; mov eax, 0; jmp esp; ret')
+            >>> jmp_addr = next(binary.search(asm('jmp esp'), executable = True))
+            >>> binary.read(jmp_addr, 2) == asm('jmp esp')
+            True
         """
         load_address_fixup = (self.address - self.load_addr)
 
         if writable:
             segments = self.writable_segments
+        elif executable:
+            segments = self.executable_segments
         else:
             segments = self.segments
 
@@ -1153,6 +1233,11 @@ class ELF(ELFFile):
             # DT_LOAD segment is **last** to load data into the region.
             self.memory.chop(start, stop_data)
 
+            # Fill the start of the segment's first page
+            page_start = align_down(0x1000, start)
+            if page_start < start and not self.memory[page_start]:
+                self.memory.addi(page_start, start, None)
+
             # Add the new segment
             if start != stop_data:
                 self.memory.addi(start, stop_data, segment)
@@ -1160,15 +1245,22 @@ class ELF(ELFFile):
             if stop_data != stop_mem:
                 self.memory.addi(stop_data, stop_mem, b'\x00')
 
+            page_end = align(0x1000, stop_mem)
+
             # Check for holes which we can fill
             if self._fill_gaps and i+1 < len(load_segments):
                 next_start = load_segments[i+1].header.p_vaddr
-                
-                if stop_mem < next_start and stop_mem>>(self.bits-1) == next_start>>(self.bits-1):
-                    self.memory.addi(stop_mem, next_start, None)
-            else:
-                page_end = (stop_mem + 0xfff) & ~(0xfff)
+                page_next = align_down(0x1000, next_start)
 
+                if stop_mem < next_start:
+                    if page_end < page_next:
+                        if stop_mem < page_end:
+                            self.memory.addi(stop_mem, page_end, None)
+                        if page_next < next_start:
+                            self.memory.addi(page_next, next_start, None)
+                    else:
+                        self.memory.addi(stop_mem, next_start, None)
+            else:
                 if stop_mem < page_end:
                     self.memory.addi(stop_mem, page_end, None)
 
@@ -1600,7 +1692,7 @@ class ELF(ELFFile):
             ``PT_GNU_STACK``
 
             The p_flags member specifies the permissions on the segment
-            containing the stack and is used to indicate wether the stack
+            containing the stack and is used to indicate whether the stack
             should be executable. The absense of this header indicates
             that the stack will be executable.
 
@@ -1764,7 +1856,7 @@ class ELF(ELFFile):
         # Check for Linux configuration, it must contain more than
         # just the version.
         if len(self.config) > 1:
-            config_opts = collections.defaultdict(lambda: [])
+            config_opts = collections.defaultdict(list)
             for checker in kernel_configuration:
                 result, message = checker(self.config)
 
@@ -1871,7 +1963,7 @@ class ELF(ELFFile):
     def unpack(self, address, *a, **kw):
         """Unpacks an integer from the specified ``address``."""
         self._update_args(kw)
-        return packing.unpack(self.read(address, context.bytes), *a, **kw)
+        return packing.unpack(self.read(address, self.bytes), *a, **kw)
 
     def string(self, address):
         """string(address) -> str

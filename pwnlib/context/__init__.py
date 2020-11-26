@@ -1,4 +1,3 @@
-#!/usr/bin/env python2
 # -*- coding: utf-8 -*-
 """
 Implements context management so that nested/scoped contexts and threaded
@@ -26,6 +25,11 @@ import socks
 from pwnlib.config import register_config
 from pwnlib.device import Device
 from pwnlib.timeout import Timeout
+
+try:
+    from collections.abc import Iterable
+except ImportError:
+    from collections import Iterable
 
 __all__ = ['context', 'ContextType', 'Thread']
 
@@ -354,7 +358,7 @@ class ContextType(object):
         'log_console': sys.stdout,
         'randomize': False,
         'rename_corefiles': True,
-        'newline': '\n',
+        'newline': b'\n',
         'noptrace': False,
         'os': 'linux',
         'proxy': None,
@@ -685,6 +689,7 @@ class ContextType(object):
                      ('x86_64', 'amd64'),
                      ('x86', 'i386'),
                      ('i686', 'i386'),
+                     ('armv7l', 'arm'),
                      ('armeabi', 'arm'),
                      ('arm64', 'aarch64')]
         for k, v in transform:
@@ -838,6 +843,8 @@ class ContextType(object):
                 return b.decode('utf-8')
             except UnicodeDecodeError:
                 return b.decode('latin1')
+            except AttributeError:
+                return b
         return b.decode(self.encoding)
 
     @_validator
@@ -1116,7 +1123,7 @@ class ContextType(object):
         if isinstance(proxy, str):
             proxy = (socks.SOCKS5, proxy)
 
-        if not isinstance(proxy, collections.Iterable):
+        if not isinstance(proxy, Iterable):
             raise AttributeError('proxy must be a string hostname, or tuple of arguments for socks.set_default_proxy')
 
         socks.set_default_proxy(*proxy)
@@ -1224,12 +1231,13 @@ class ContextType(object):
             >>> cache_dir == context.cache_dir
             True
         """
-        home = os.path.expanduser('~')
+        xdg_cache_home = os.environ.get('XDG_CACHE_HOME') or \
+                         os.path.join(os.path.expanduser('~'), '.cache')
 
-        if not os.access(home, os.W_OK):
+        if not os.access(xdg_cache_home, os.W_OK):
             return None
 
-        cache = os.path.join(home, '.pwntools-cache-%d.%d' % sys.version_info[:2])
+        cache = os.path.join(xdg_cache_home, '.pwntools-cache-%d.%d' % sys.version_info[:2])
 
         if not os.path.exists(cache):
             try:
@@ -1269,6 +1277,15 @@ class ContextType(object):
         Default value is ``True``.
         """
         return bool(v)
+
+    @_validator
+    def newline(self, v):
+        """Line ending used for Tubes by default.
+
+        This configures the newline emitted by e.g. ``sendline`` or that is used
+        as a delimiter for e.g. ``recvline``.
+        """
+        return six.ensure_binary(v)
 
 
     @_validator

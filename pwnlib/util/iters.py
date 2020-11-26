@@ -136,6 +136,13 @@ def consume(n, iterator):
       >>> consume(2, i)
       >>> list(i)
       [3, 4, 5]
+      >>> def g():
+      ...     for i in range(2):
+      ...         yield i
+      ...         print(i)
+      >>> consume(None, g())
+      0
+      1
     """
     # Use functions that consume iterators at C speed.
     if n is None:
@@ -725,6 +732,12 @@ def chained(func):
       ...         yield (x, -x)
       >>> take(6, g())
       [0, 0, 1, -1, 2, -2]
+      >>> @chained
+      ... def g2():
+      ...     for x in range(3):
+      ...         yield (x, -x)
+      >>> list(g2())
+      [0, 0, 1, -1, 2, -2]
     """
     def wrapper(*args, **kwargs):
         for xs in func(*args, **kwargs):
@@ -758,10 +771,8 @@ def bruteforce(func, alphabet, length, method = 'upto', start = None, databag = 
       if the search space was exhausted.
 
     Example:
-      >>> bruteforce(lambda x: x == 'hello', string.ascii_lowercase, length = 10)
-      'hello'
-      >>> bruteforce(lambda x: x == 'hello', 'hllo', 5) is None
-      True
+      >>> bruteforce(lambda x: x == 'yes', string.ascii_lowercase, length=5)
+      'yes'
     """
 
     if   method == 'upto' and length > 1:
@@ -810,7 +821,7 @@ def bruteforce(func, alphabet, length, method = 'upto', start = None, databag = 
 
     h = log.waitfor('Bruteforcing')
     cur_iteration = 0
-    if start != None:
+    if start is not None:
         consume(i, iterator)
     for e in iterator:
         cur = ''.join(e)
@@ -826,11 +837,18 @@ def bruteforce(func, alphabet, length, method = 'upto', start = None, databag = 
         if res:
             h.success('Found key: "%s"' % cur)
             return cur
-        if start != None:
+        if start is not None:
             consume(N - 1, iterator)
 
     h.failure('No matches found')
 
+
+def _mbruteforcewrap(func, alphabet, length, method, start, databag):
+    oldloglevel = context.log_level
+    context.log_level = 'critical'
+    res = bruteforce(func, alphabet, length, method=method, start=start, databag=databag)
+    context.log_level = oldloglevel
+    databag["result"] = res
 
 
 def mbruteforce(func, alphabet, length, method = 'upto', start = None, threads = None):
@@ -841,19 +859,22 @@ def mbruteforce(func, alphabet, length, method = 'upto', start = None, threads =
     Arguments:
       func, alphabet, length, method, start: same as for bruteforce()
       threads: Amount of threads to spawn, default is the amount of cores.
+
+    Example:
+      >>> mbruteforce(lambda x: x == 'hello', string.ascii_lowercase, length = 10)
+      'hello'
+      >>> mbruteforce(lambda x: x == 'hello', 'hlo', 5, 'downfrom') is None
+      True
+      >>> mbruteforce(lambda x: x == 'no', string.ascii_lowercase, length=2, method='fixed')
+      'no'
+      >>> mbruteforce(lambda x: x == '9999', string.digits, length=4, threads=1, start=(2, 2))
+      '9999'
     """
 
-    def bruteforcewrap(func, alphabet, length, method, start, databag):
-        oldloglevel = context.log_level
-        context.log_level = 'critical'
-        res = bruteforce(func, alphabet, length, method=method, start=start, databag=databag)
-        context.log_level = oldloglevel
-        databag["result"] = res
-
-    if start == None:
+    if start is None:
         start = (1, 1)
 
-    if threads == None:
+    if threads is None:
         try:
             threads = multiprocessing.cpu_count()
         except NotImplementedError:
@@ -875,7 +896,7 @@ def mbruteforce(func, alphabet, length, method = 'upto', start = None, threads =
 
         chunkid = (i2-1) + (i * N2) + 1
 
-        processes[i] = multiprocessing.Process(target=bruteforcewrap,
+        processes[i] = multiprocessing.Process(target=_mbruteforcewrap,
                 args=(func, alphabet, length, method, (chunkid, totalchunks),
                         shareddata[i]))
         processes[i].start()
@@ -885,9 +906,9 @@ def mbruteforce(func, alphabet, length, method = 'upto', start = None, threads =
     while not done:
         # log status
         current_item_list = ",".join(["\"%s\"" % x["current_item"]
-                                for x in shareddata if x != None])
-        items_done = sum([x["items_done"] for x in shareddata if x != None])
-        items_total = sum([x["items_total"] for x in shareddata if x != None])
+                                for x in shareddata if x is not None])
+        items_done = sum([x["items_done"] for x in shareddata if x is not None])
+        items_total = sum([x["items_total"] for x in shareddata if x is not None])
 
         progress = 100.0 * items_done / items_total if items_total != 0 else 0.0
 
@@ -895,23 +916,23 @@ def mbruteforce(func, alphabet, length, method = 'upto', start = None, threads =
 
         # handle finished threads
         for i in range(threads):
-            if processes[i] and processes[i].exitcode != None:
+            if processes[i] and processes[i].exitcode is not None:
                 # thread has terminated
                 res = shareddata[i]["result"]
                 processes[i].join()
                 processes[i] = None
 
                 # if successful, kill all other threads and return success
-                if res != None:
+                if res is not None:
                     for i in range(threads):
-                        if processes[i] != None:
+                        if processes[i] is not None:
                             processes[i].terminate()
                             processes[i].join()
                             processes[i] = None
                     h.success('Found key: "%s"' % res)
                     return res
 
-                if all([x == None for x in processes]):
+                if all([x is None for x in processes]):
                     done = True
         time.sleep(0.3)
     h.failure('No matches found')

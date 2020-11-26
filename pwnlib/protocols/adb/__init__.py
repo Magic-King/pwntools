@@ -107,9 +107,10 @@ class AdbClient(Logger):
                 and self.port == context.defaults['adb_port']:
                     log.warn("Could not connect to ADB server, trying to start it")
                     process(context.adb + ['start-server']).recvall()
+                    time.sleep(0.3)
                 else:
-                    log.exception('Could not connect to ADB server (%s:%s)' % \
-                                    (self.host, self.port))
+                    log.exception('Could not connect to ADB server (%s:%s)',
+                                  self.host, self.port)
 
         # Final attempt...
         if not self._c:
@@ -168,6 +169,7 @@ class AdbClient(Logger):
 
         >>> c.version() > (4,0)
         True
+        >>> c.wait_for_device() # ensure doctests alive
         """
         try:
             self.send('host:kill')
@@ -223,8 +225,8 @@ class AdbClient(Logger):
                 l = l.decode('utf-8')
             yield l
 
-    def transport(self, serial=None):
-        """Sets the Transport on the rmeote device.
+    def transport(self, serial=None, try_again=True):
+        """Sets the Transport on the remote device.
 
         Examples:
 
@@ -244,10 +246,14 @@ class AdbClient(Logger):
             msg = 'host:transport-any'
 
         if self.send(msg) == FAIL:
+            err = self.recvl().decode('utf-8')
+            if err == 'device offline' and try_again:
+                self.wait_for_device(serial)
+                return self.transport(serial, try_again=False)
             if serial:
-                self.error("Could not set transport to %r" % serial)
+                self.error("Could not set transport to %r (%s)" % (serial, err))
             else:
-                self.error("Could not set transport 'any'")
+                self.error("Could not set transport 'any' (%s)" % err)
 
     @_autoclose
     @_with_transport
@@ -289,7 +295,9 @@ class AdbClient(Logger):
     @_with_transport
     def root(self):
         self.send('root:')
-        return self.c.recvall().decode('utf-8')
+        rv = self.c.recvall().decode('utf-8')
+        time.sleep(0.1)
+        return rv
 
     @_autoclose
     @_with_transport
@@ -336,22 +344,25 @@ class AdbClient(Logger):
 
         # The first OKAY is that the command was understood
         if response != OKAY:
-            self.error("An error occurred while waiting for device with serial %r" % serial)
+            if response == FAIL:
+                response = self.recvl().decode('utf-8')
+            self.error("An error occurred while trying to wait for device with serial %r (%r)" % (serial, response))
 
         # The second OKAY is that the device is available
         response = self.c.recvn(4)
         if response != OKAY:
-            self.error("An error occurred while waiting for device with serial %r" % serial)
+            if response == FAIL:
+                response = self.recvl().decode('utf-8')
+            self.error("An error occurred while waiting for device with serial %r (%r)" % (serial, response))
 
     def _sync(fn):
         """Decorator which enters 'sync:' mode to the selected transport,
         then invokes the decorated funciton."""
         @functools.wraps(fn)
         def wrapper(self, *a, **kw):
-            rv = None
-            if FAIL != self.send('sync:'):
-                rv = fn(self, *a, **kw)
-            return rv
+            if self.send('sync:') == FAIL:
+                self.error("An error occurred while trying to use SYNC API (%r)" % self.recvl().decode('utf-8'))
+            return fn(self, *a, **kw)
         return wrapper
 
     def list(self, path):
@@ -381,8 +392,10 @@ class AdbClient(Logger):
 
         Examples:
 
+            >>> _ = AdbClient().root()
+            >>> AdbClient().wait_for_device()
             >>> pprint(AdbClient().list('/data/user'))
-            {'0': {'mode': 41471, 'size': 11, 'time': ...}}
+            {'0': {'mode': 41471, 'size': 10, 'time': ...}}
             >>> AdbClient().list('/does/not/exist')
             Traceback (most recent call last):
             ...
@@ -449,14 +462,14 @@ class AdbClient(Logger):
             >>> expected = {'mode': 16749, 'size': 0, 'time': 0}
             >>> pwnlib.protocols.adb.AdbClient().stat('/proc')           == expected
             True
-            >>> pwnlib.protocols.adb.AdbClient().stat('/does/not/exist') == None
+            >>> pwnlib.protocols.adb.AdbClient().stat('/does/not/exist') is None
             True
         """
         if isinstance(path, six.text_type):
             path = path.encode('utf-8')
         self.c.flat32('STAT', len(path), path)
         if self.c.recvn(4) != b'STAT':
-            self.error("An error occured while attempting to STAT a file.")
+            self.error("An error occurred while attempting to STAT a file.")
 
         mode = self.c.u32()
         size = self.c.u32()

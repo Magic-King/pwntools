@@ -32,10 +32,6 @@ class tube(Timeout, Logger):
     default = Timeout.default
     forever = Timeout.forever
 
-    #: Delimiter to use for :meth:`sendline`, :meth:`recvline`,
-    #: and related functions.
-    newline = b'\n'
-
     def __init__(self, timeout = default, level = None, *a, **kw):
         super(tube, self).__init__(timeout)
 
@@ -44,7 +40,34 @@ class tube(Timeout, Logger):
             self.setLevel(level)
 
         self.buffer = Buffer(*a, **kw)
+        self._newline = None
         atexit.register(self.close)
+
+    @property
+    def newline(self):
+        r'''Character sent with methods like sendline() or used for recvline().
+
+            >>> t = tube()
+            >>> t.newline = 'X'
+            >>> t.unrecv('A\nB\nCX')
+            >>> t.recvline()
+            b'A\nB\nCX'
+
+            >>> t = tube()
+            >>> context.newline = '\r\n'
+            >>> t.newline
+            b'\r\n'
+
+            # Clean up
+            >>> context.clear()
+        '''
+        if self._newline is not None:
+            return self._newline
+        return context.newline
+
+    @newline.setter
+    def newline(self, newline):
+        self._newline = six.ensure_binary(newline)
 
     # Functions based on functions from subclasses
     def recv(self, numb = None, timeout = default):
@@ -498,11 +521,11 @@ class tube(Timeout, Logger):
                 try:
                     line = self.recvline(keepends=True)
                 except Exception:
-                    self.buffer.add(tmpbuf)
+                    self.buffer.unget(tmpbuf)
                     raise
 
                 if not line:
-                    self.buffer.add(tmpbuf)
+                    self.buffer.unget(tmpbuf)
                     return b''
 
                 if pred(line):
@@ -589,7 +612,7 @@ class tube(Timeout, Logger):
     def recvline_endswith(self, delims, keepends=False, timeout=default):
         r"""recvline_endswith(delims, keepends=False, timeout=default) -> bytes
 
-        Keep receiving lines until one is found that starts with one of
+        Keep receiving lines until one is found that ends with one of
         `delims`.  Returns the last line received.
 
         If the request is not satisfied before ``timeout`` seconds pass,
@@ -1106,11 +1129,14 @@ class tube(Timeout, Logger):
         """
         self << other << self
 
-    def wait_for_close(self):
+    def wait_for_close(self, timeout=default):
         """Waits until the tube is closed."""
 
-        while self.connected():
-            time.sleep(0.05)
+        with self.countdown(timeout):
+            while self.countdown_active():
+                if not self.connected():
+                    return
+                time.sleep(min(self.timeout, 0.05))
 
     wait = wait_for_close
 
@@ -1373,11 +1399,11 @@ class tube(Timeout, Logger):
         def wrapperb(self, *a, **kw):
             return bytearray(func(self, *a, **kw))
         def wrapperS(self, *a, **kw):
-            return context._encode(func(self, *a, **kw))
+            return context._decode(func(self, *a, **kw))
         wrapperb.__doc__ = 'Same as :meth:`{func.__name__}`, but returns a bytearray'.format(func=func)
         wrapperb.__name__ = func.__name__ + 'b'
-        wrapperS.__doc__ = 'Same as :meth:`{func.__name__}`, but returns a str,' \
-                           'decoding the result using `context.encoding`.' \
+        wrapperS.__doc__ = 'Same as :meth:`{func.__name__}`, but returns a str, ' \
+                           'decoding the result using `context.encoding`. ' \
                            '(note that the binary versions are way faster)'.format(func=func)
         wrapperS.__name__ = func.__name__ + 'S'
         return wrapperb, wrapperS
